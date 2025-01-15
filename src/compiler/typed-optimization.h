@@ -43,7 +43,9 @@ class V8_EXPORT_PRIVATE TypedOptimization final
   Reduction ReduceCheckHeapObject(Node* node);
   Reduction ReduceCheckMaps(Node* node);
   Reduction ReduceCheckNumber(Node* node);
+  Reduction ReduceCheckNumberFitsInt32(Node* node);
   Reduction ReduceCheckString(Node* node);
+  Reduction ReduceCheckStringOrStringWrapper(Node* node);
   Reduction ReduceCheckEqualsInternalizedString(Node* node);
   Reduction ReduceCheckEqualsSymbol(Node* node);
   Reduction ReduceLoadField(Node* node);
@@ -66,12 +68,13 @@ class V8_EXPORT_PRIVATE TypedOptimization final
   Reduction ReduceSpeculativeNumberPow(Node* node);
   Reduction ReduceSpeculativeNumberBinop(Node* node);
   Reduction ReduceSpeculativeNumberComparison(Node* node);
+  Reduction ReduceTransitionElementsKindOrCheckMap(Node* node);
 
   Reduction TryReduceStringComparisonOfStringFromSingleCharCode(
       Node* comparison, Node* from_char_code, Type constant_type,
       bool inverted);
   Reduction TryReduceStringComparisonOfStringFromSingleCharCodeToConstant(
-      Node* comparison, const StringRef& string, bool inverted);
+      Node* comparison, StringRef string, bool inverted);
   const Operator* NumberComparisonFor(const Operator* op);
 
   Node* ConvertPlainPrimitiveToNumber(Node* node);

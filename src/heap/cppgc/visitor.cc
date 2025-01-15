@@ -4,6 +4,7 @@
 
 #include "src/heap/cppgc/visitor.h"
 
+#include "src/base/sanitizer/asan.h"
 #include "src/base/sanitizer/msan.h"
 #include "src/heap/cppgc/gc-info-table.h"
 #include "src/heap/cppgc/heap-base.h"
@@ -31,18 +32,20 @@ ConservativeTracingVisitor::ConservativeTracingVisitor(
     HeapBase& heap, PageBackend& page_backend, cppgc::Visitor& visitor)
     : heap_(heap), page_backend_(page_backend), visitor_(visitor) {}
 
+// Conservative scanning of objects is not compatible with ASAN as we may scan
+// over objects reading poisoned memory. One such example was added to libc++
+// (June 2024) in the form of container annotations for short std::string.
+DISABLE_ASAN
 void ConservativeTracingVisitor::TraceConservatively(
     const HeapObjectHeader& header) {
   const auto object_view = ObjectView<>(header);
   uintptr_t* word = reinterpret_cast<uintptr_t*>(object_view.Start());
   for (size_t i = 0; i < (object_view.Size() / sizeof(uintptr_t)); ++i) {
     uintptr_t maybe_full_ptr = word[i];
-#if defined(MEMORY_SANITIZER)
     // |object| may be uninitialized by design or just contain padding bytes.
     // Copy into a local variable that is not poisoned for conservative marking.
     // Copy into a temporary variable to maintain the original MSAN state.
     MSAN_MEMORY_IS_INITIALIZED(&maybe_full_ptr, sizeof(maybe_full_ptr));
-#endif
     // First, check the full pointer.
     if (maybe_full_ptr > SentinelPointer::kSentinelValue)
       this->TraceConservativelyIfNeeded(
@@ -65,20 +68,20 @@ void ConservativeTracingVisitor::TraceConservatively(
 }
 
 void ConservativeTracingVisitor::TryTracePointerConservatively(
-    Address pointer) {
+    Address address) {
 #if defined(CPPGC_CAGED_HEAP)
   // TODO(chromium:1056170): Add support for SIMD in stack scanning.
-  if (V8_LIKELY(!CagedHeapBase::IsWithinCage(pointer))) return;
+  if (V8_LIKELY(!CagedHeapBase::IsWithinCage(address))) return;
 #endif  // defined(CPPGC_CAGED_HEAP)
 
   const BasePage* page = reinterpret_cast<const BasePage*>(
-      page_backend_.Lookup(const_cast<ConstAddress>(pointer)));
+      page_backend_.Lookup(const_cast<ConstAddress>(address)));
 
   if (!page) return;
 
   DCHECK_EQ(&heap_, &page->heap());
 
-  auto* header = page->TryObjectHeaderFromInnerAddress(pointer);
+  auto* header = page->TryObjectHeaderFromInnerAddress(address);
 
   if (!header) return;
 
@@ -88,7 +91,6 @@ void ConservativeTracingVisitor::TryTracePointerConservatively(
 void ConservativeTracingVisitor::TraceConservativelyIfNeeded(
     const void* address) {
   auto pointer = reinterpret_cast<Address>(const_cast<void*>(address));
-  TryTracePointerConservatively(pointer);
 #if defined(CPPGC_POINTER_COMPRESSION)
   auto try_trace = [this](Address ptr) {
     if (ptr > reinterpret_cast<Address>(SentinelPointer::kSentinelValue))
@@ -104,7 +106,6 @@ void ConservativeTracingVisitor::TraceConservativelyIfNeeded(
       static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pointer) >>
                             (sizeof(uint32_t) * CHAR_BIT))));
   try_trace(decompressed_high);
-#if !defined(CPPGC_2GB_CAGE)
   // In addition, check half-compressed halfwords, since the compiler is free to
   // spill intermediate results of compression/decompression onto the stack.
   const uintptr_t base = CagedHeapBase::GetBase();
@@ -117,7 +118,8 @@ void ConservativeTracingVisitor::TraceConservativelyIfNeeded(
                             (sizeof(uint32_t) * CHAR_BIT)) |
       base);
   try_trace(intermediate_decompressed_high);
-#endif  // !defined(CPPGC_2GB_CAGE)
+#else   // !defined(CPPGC_POINTER_COMPRESSION)
+  TryTracePointerConservatively(pointer);
 #endif  // defined(CPPGC_POINTER_COMPRESSION)
 }
 

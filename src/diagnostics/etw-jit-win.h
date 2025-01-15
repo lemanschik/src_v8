@@ -8,6 +8,7 @@
 #include <atomic>
 
 #include "include/v8config.h"
+#include "src/base/macros.h"
 
 namespace v8 {
 
@@ -16,19 +17,15 @@ struct JitCodeEvent;
 
 namespace internal {
 namespace ETWJITInterface {
-extern std::atomic<bool> is_etw_enabled;
+extern V8_EXPORT_PRIVATE std::atomic<bool>
+    has_active_etw_tracing_session_or_custom_filter;
 
 void Register();
 void Unregister();
 void AddIsolate(Isolate* isolate);
 void RemoveIsolate(Isolate* isolate);
 void EventHandler(const v8::JitCodeEvent* event);
-void EnableETWLog(Isolate* isolate);
-V8_INLINE void MaybeSetHandlerNow(Isolate* isolate) {
-  if (is_etw_enabled) {
-    EnableETWLog(isolate);
-  }
-}
+void MaybeSetHandlerNow(Isolate* isolate);
 }  // namespace ETWJITInterface
 }  // namespace internal
 }  // namespace v8

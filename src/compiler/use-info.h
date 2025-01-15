@@ -5,13 +5,20 @@
 #ifndef V8_COMPILER_USE_INFO_H_
 #define V8_COMPILER_USE_INFO_H_
 
-#include "src/base/functional.h"
+#include "src/base/hashing.h"
+#include "src/codegen/machine-type.h"
 #include "src/compiler/feedback-source.h"
 #include "src/compiler/globals.h"
 
 namespace v8::internal::compiler {
 
-enum IdentifyZeros : uint8_t { kIdentifyZeros, kDistinguishZeros };
+// Enum to specify if `+0` and `-0` should be treated as the same value.
+enum IdentifyZeros : uint8_t {
+  // `+0` and `-0` should be treated as the same value.
+  kIdentifyZeros,
+  // `+0` and `-0` should be treated as different values.
+  kDistinguishZeros
+};
 
 class Truncation;
 size_t hash_value(const Truncation&);
@@ -55,6 +62,7 @@ class Truncation final {
     return LessGeneral(kind_, TruncationKind::kWord32);
   }
   bool IsUsedAsWord64() const {
+    DCHECK(Is64());
     return LessGeneral(kind_, TruncationKind::kWord64);
   }
   bool TruncatesOddballAndBigIntToNumber() const {
@@ -189,7 +197,11 @@ class UseInfo {
   static UseInfo TruncatingWord32() {
     return UseInfo(MachineRepresentation::kWord32, Truncation::Word32());
   }
+  static UseInfo TruncatingWord64() {
+    return UseInfo(MachineRepresentation::kWord64, Truncation::Word64());
+  }
   static UseInfo CheckedBigIntTruncatingWord64(const FeedbackSource& feedback) {
+    DCHECK(Is64());
     // Note that Trunction::Word64() can safely use kIdentifyZero, because
     // TypeCheckKind::kBigInt will make sure we deopt for anything other than
     // type BigInt anyway.
@@ -197,11 +209,13 @@ class UseInfo {
                    TypeCheckKind::kBigInt, feedback);
   }
   static UseInfo CheckedBigInt64AsWord64(const FeedbackSource& feedback) {
+    DCHECK(Is64());
     return UseInfo(MachineRepresentation::kWord64, Truncation::Any(),
                    TypeCheckKind::kBigInt64, feedback);
   }
-  static UseInfo Word64() {
-    return UseInfo(MachineRepresentation::kWord64, Truncation::Any());
+  static UseInfo Word64(IdentifyZeros identify_zeros = kDistinguishZeros) {
+    return UseInfo(MachineRepresentation::kWord64,
+                   Truncation::Any(identify_zeros));
   }
   static UseInfo Word() {
     return UseInfo(MachineType::PointerRepresentation(), Truncation::Any());
