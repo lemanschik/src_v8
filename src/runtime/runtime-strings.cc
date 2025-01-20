@@ -9,47 +9,12 @@
 #include "src/objects/objects-inl.h"
 #include "src/objects/slots.h"
 #include "src/objects/smi.h"
+#include "src/runtime/runtime-utils.h"
 #include "src/strings/string-builder-inl.h"
-
-#if V8_ENABLE_WEBASSEMBLY
-// TODO(chromium:1236668): Drop this when the "SaveAndClearThreadInWasmFlag"
-// approach is no longer needed.
-#include "src/trap-handler/trap-handler.h"
-#endif  // V8_ENABLE_WEBASSEMBLY
+#include "src/strings/unicode-inl.h"
 
 namespace v8 {
 namespace internal {
-
-namespace {
-
-#if V8_ENABLE_WEBASSEMBLY
-class V8_NODISCARD SaveAndClearThreadInWasmFlag {
- public:
-  explicit SaveAndClearThreadInWasmFlag(Isolate* isolate) : isolate_(isolate) {
-    if (trap_handler::IsTrapHandlerEnabled()) {
-      if (trap_handler::IsThreadInWasm()) {
-        thread_was_in_wasm_ = true;
-        trap_handler::ClearThreadInWasm();
-      }
-    }
-  }
-  ~SaveAndClearThreadInWasmFlag() {
-    if (thread_was_in_wasm_ && !isolate_->has_pending_exception()) {
-      trap_handler::SetThreadInWasm();
-    }
-  }
-
- private:
-  bool thread_was_in_wasm_{false};
-  Isolate* isolate_;
-};
-#define CLEAR_THREAD_IN_WASM_SCOPE \
-  SaveAndClearThreadInWasmFlag non_wasm_scope(isolate)
-#else
-#define CLEAR_THREAD_IN_WASM_SCOPE (void)0
-#endif  // V8_ENABLE_WEBASSEMBLY
-
-}  // namespace
 
 RUNTIME_FUNCTION(Runtime_GetSubstitution) {
   HandleScope scope(isolate);
@@ -77,7 +42,7 @@ RUNTIME_FUNCTION(Runtime_GetSubstitution) {
       *capture_exists = false;
       return match_;  // Return arbitrary string handle.
     }
-    MaybeHandle<String> GetNamedCapture(Handle<String> name,
+    MaybeHandle<String> GetNamedCapture(DirectHandle<String> name,
                                         CaptureState* state) override {
       UNREACHABLE();
     }
@@ -107,10 +72,10 @@ MaybeHandle<String> StringReplaceOneCharWithString(
     return MaybeHandle<String>();
   }
   recursion_limit--;
-  if (subject->IsConsString()) {
-    ConsString cons = ConsString::cast(*subject);
-    Handle<String> first = handle(cons.first(), isolate);
-    Handle<String> second = handle(cons.second(), isolate);
+  if (IsConsString(*subject)) {
+    Tagged<ConsString> cons = Cast<ConsString>(*subject);
+    Handle<String> first = handle(cons->first(), isolate);
+    Handle<String> second = handle(cons->second(), isolate);
     Handle<String> new_first;
     if (!StringReplaceOneCharWithString(isolate, first, search, replace, found,
                                         recursion_limit).ToHandle(&new_first)) {
@@ -134,8 +99,7 @@ MaybeHandle<String> StringReplaceOneCharWithString(
     Handle<String> first = isolate->factory()->NewSubString(subject, 0, index);
     Handle<String> cons1;
     ASSIGN_RETURN_ON_EXCEPTION(
-        isolate, cons1, isolate->factory()->NewConsString(first, replace),
-        String);
+        isolate, cons1, isolate->factory()->NewConsString(first, replace));
     Handle<String> second =
         isolate->factory()->NewSubString(subject, index + 1, subject->length());
     return isolate->factory()->NewConsString(cons1, second);
@@ -153,22 +117,20 @@ RUNTIME_FUNCTION(Runtime_StringReplaceOneCharWithString) {
   // retry with a flattened subject string.
   const int kRecursionLimit = 0x1000;
   bool found = false;
-  Handle<String> result;
+  DirectHandle<String> result;
   if (StringReplaceOneCharWithString(isolate, subject, search, replace, &found,
                                      kRecursionLimit).ToHandle(&result)) {
     return *result;
   }
-  if (isolate->has_pending_exception())
-    return ReadOnlyRoots(isolate).exception();
+  if (isolate->has_exception()) return ReadOnlyRoots(isolate).exception();
 
   subject = String::Flatten(isolate, subject);
   if (StringReplaceOneCharWithString(isolate, subject, search, replace, &found,
                                      kRecursionLimit).ToHandle(&result)) {
     return *result;
   }
-  if (isolate->has_pending_exception())
-    return ReadOnlyRoots(isolate).exception();
-  // In case of empty handle and no pending exception we have stack overflow.
+  if (isolate->has_exception()) return ReadOnlyRoots(isolate).exception();
+  // In case of empty handle and no exception we have stack overflow.
   return isolate->StackOverflow();
 }
 
@@ -191,8 +153,8 @@ RUNTIME_FUNCTION(Runtime_StringSubstring) {
 }
 
 RUNTIME_FUNCTION(Runtime_StringAdd) {
-  // This is used by Wasm stringrefs.
-  CLEAR_THREAD_IN_WASM_SCOPE;
+  // This is used by Wasm.
+  SaveAndClearThreadInWasmFlag non_wasm_scope(isolate);
   HandleScope scope(isolate);
   DCHECK_EQ(2, args.length());
   Handle<String> str1 = args.at<String>(0);
@@ -210,6 +172,7 @@ RUNTIME_FUNCTION(Runtime_InternalizeString) {
 }
 
 RUNTIME_FUNCTION(Runtime_StringCharCodeAt) {
+  SaveAndClearThreadInWasmFlag non_wasm_scope(isolate);
   HandleScope handle_scope(isolate);
   DCHECK_EQ(2, args.length());
 
@@ -228,47 +191,67 @@ RUNTIME_FUNCTION(Runtime_StringCharCodeAt) {
   return Smi::FromInt(subject->Get(i));
 }
 
+RUNTIME_FUNCTION(Runtime_StringCodePointAt) {
+  HandleScope handle_scope(isolate);
+  DCHECK_EQ(2, args.length());
+
+  Handle<String> subject = args.at<String>(0);
+  uint32_t i = NumberToUint32(args[1]);
+
+  // Flatten the string.  If someone wants to get a char at an index
+  // in a cons string, it is likely that more indices will be
+  // accessed.
+  subject = String::Flatten(isolate, subject);
+
+  if (i >= static_cast<uint32_t>(subject->length())) {
+    return ReadOnlyRoots(isolate).nan_value();
+  }
+
+  int first_code_point = subject->Get(i);
+  if ((first_code_point & 0xFC00) != 0xD800) {
+    return Smi::FromInt(first_code_point);
+  }
+
+  if (i + 1 >= static_cast<uint32_t>(subject->length())) {
+    return Smi::FromInt(first_code_point);
+  }
+
+  int second_code_point = subject->Get(i + 1);
+  if ((second_code_point & 0xFC00) != 0xDC00) {
+    return Smi::FromInt(first_code_point);
+  }
+
+  int surrogate_offset = 0x10000 - (0xD800 << 10) - 0xDC00;
+  return Smi::FromInt((first_code_point << 10) +
+                      (second_code_point + surrogate_offset));
+}
+
 RUNTIME_FUNCTION(Runtime_StringBuilderConcat) {
   HandleScope scope(isolate);
   DCHECK_EQ(3, args.length());
-  Handle<JSArray> array = args.at<JSArray>(0);
-  int32_t array_length;
-  if (!args[1].ToInt32(&array_length)) {
-    THROW_NEW_ERROR_RETURN_FAILURE(isolate, NewInvalidStringLengthError());
-  }
-  Handle<String> special = args.at<String>(2);
+  DirectHandle<FixedArray> array = args.at<FixedArray>(0);
 
-  size_t actual_array_length = 0;
-  CHECK(TryNumberToSize(array->length(), &actual_array_length));
-  CHECK_GE(array_length, 0);
-  CHECK(static_cast<size_t>(array_length) <= actual_array_length);
+  int array_length = args.smi_value_at(1);
+
+  DirectHandle<String> special = args.at<String>(2);
 
   // This assumption is used by the slice encoding in one or two smis.
   DCHECK_GE(Smi::kMaxValue, String::kMaxLength);
 
-  CHECK(array->HasFastElements());
-  JSObject::EnsureCanContainHeapObjectElements(array);
-
   int special_length = special->length();
-  if (!array->HasObjectElements()) {
-    return isolate->Throw(ReadOnlyRoots(isolate).illegal_argument_string());
-  }
 
   int length;
   bool one_byte = special->IsOneByteRepresentation();
 
   {
     DisallowGarbageCollection no_gc;
-    FixedArray fixed_array = FixedArray::cast(array->elements());
-    if (fixed_array.length() < array_length) {
-      array_length = fixed_array.length();
-    }
+    Tagged<FixedArray> fixed_array = *array;
 
     if (array_length == 0) {
       return ReadOnlyRoots(isolate).empty_string();
     } else if (array_length == 1) {
-      Object first = fixed_array.get(0);
-      if (first.IsString()) return first;
+      Tagged<Object> first = fixed_array->get(0);
+      if (IsString(first)) return first;
     }
     length = StringBuilderConcatLength(special_length, fixed_array,
                                        array_length, &one_byte);
@@ -282,21 +265,19 @@ RUNTIME_FUNCTION(Runtime_StringBuilderConcat) {
   }
 
   if (one_byte) {
-    Handle<SeqOneByteString> answer;
+    DirectHandle<SeqOneByteString> answer;
     ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
         isolate, answer, isolate->factory()->NewRawOneByteString(length));
     DisallowGarbageCollection no_gc;
-    StringBuilderConcatHelper(*special, answer->GetChars(no_gc),
-                              FixedArray::cast(array->elements()),
+    StringBuilderConcatHelper(*special, answer->GetChars(no_gc), *array,
                               array_length);
     return *answer;
   } else {
-    Handle<SeqTwoByteString> answer;
+    DirectHandle<SeqTwoByteString> answer;
     ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
         isolate, answer, isolate->factory()->NewRawTwoByteString(length));
     DisallowGarbageCollection no_gc;
-    StringBuilderConcatHelper(*special, answer->GetChars(no_gc),
-                              FixedArray::cast(array->elements()),
+    StringBuilderConcatHelper(*special, answer->GetChars(no_gc), *array,
                               array_length);
     return *answer;
   }
@@ -314,7 +295,7 @@ RUNTIME_FUNCTION(Runtime_StringToArray) {
   const int length =
       static_cast<int>(std::min(static_cast<uint32_t>(s->length()), limit));
 
-  Handle<FixedArray> elements = isolate->factory()->NewFixedArray(length);
+  DirectHandle<FixedArray> elements = isolate->factory()->NewFixedArray(length);
   bool elements_are_initialized = false;
 
   if (s->IsFlat() && s->IsOneByteRepresentation()) {
@@ -326,12 +307,12 @@ RUNTIME_FUNCTION(Runtime_StringToArray) {
     // a LookupSingleCharacterStringFromCode for each of the characters.
     if (content.IsOneByte()) {
       base::Vector<const uint8_t> chars = content.ToOneByteVector();
-      FixedArray one_byte_table =
+      Tagged<FixedArray> one_byte_table =
           isolate->heap()->single_character_string_table();
       for (int i = 0; i < length; ++i) {
-        Object value = one_byte_table.get(chars[i]);
-        DCHECK(value.IsString());
-        DCHECK(ReadOnlyHeap::Contains(HeapObject::cast(value)));
+        Tagged<Object> value = one_byte_table->get(chars[i]);
+        DCHECK(IsString(value));
+        DCHECK(ReadOnlyHeap::Contains(Cast<HeapObject>(value)));
         // The single-character strings are in RO space so it should
         // be safe to skip the write barriers.
         elements->set(i, value, SKIP_WRITE_BARRIER);
@@ -342,7 +323,7 @@ RUNTIME_FUNCTION(Runtime_StringToArray) {
 
   if (!elements_are_initialized) {
     for (int i = 0; i < length; ++i) {
-      Handle<Object> str =
+      DirectHandle<Object> str =
           isolate->factory()->LookupSingleCharacterStringFromCode(s->Get(i));
       elements->set(i, *str);
     }
@@ -350,7 +331,7 @@ RUNTIME_FUNCTION(Runtime_StringToArray) {
 
 #ifdef DEBUG
   for (int i = 0; i < length; ++i) {
-    DCHECK_EQ(String::cast(elements->get(i)).length(), 1);
+    DCHECK_EQ(Cast<String>(elements->get(i))->length(), 1);
   }
 #endif
 
@@ -360,8 +341,8 @@ RUNTIME_FUNCTION(Runtime_StringToArray) {
 RUNTIME_FUNCTION(Runtime_StringLessThan) {
   HandleScope handle_scope(isolate);
   DCHECK_EQ(2, args.length());
-  Handle<String> x = args.at<String>(0);
-  Handle<String> y = args.at<String>(1);
+  DirectHandle<String> x = args.at<String>(0);
+  DirectHandle<String> y = args.at<String>(1);
   ComparisonResult result = String::Compare(isolate, x, y);
   DCHECK_NE(result, ComparisonResult::kUndefined);
   return isolate->heap()->ToBoolean(
@@ -371,8 +352,8 @@ RUNTIME_FUNCTION(Runtime_StringLessThan) {
 RUNTIME_FUNCTION(Runtime_StringLessThanOrEqual) {
   HandleScope handle_scope(isolate);
   DCHECK_EQ(2, args.length());
-  Handle<String> x = args.at<String>(0);
-  Handle<String> y = args.at<String>(1);
+  DirectHandle<String> x = args.at<String>(0);
+  DirectHandle<String> y = args.at<String>(1);
   ComparisonResult result = String::Compare(isolate, x, y);
   DCHECK_NE(result, ComparisonResult::kUndefined);
   return isolate->heap()->ToBoolean(
@@ -382,8 +363,8 @@ RUNTIME_FUNCTION(Runtime_StringLessThanOrEqual) {
 RUNTIME_FUNCTION(Runtime_StringGreaterThan) {
   HandleScope handle_scope(isolate);
   DCHECK_EQ(2, args.length());
-  Handle<String> x = args.at<String>(0);
-  Handle<String> y = args.at<String>(1);
+  DirectHandle<String> x = args.at<String>(0);
+  DirectHandle<String> y = args.at<String>(1);
   ComparisonResult result = String::Compare(isolate, x, y);
   DCHECK_NE(result, ComparisonResult::kUndefined);
   return isolate->heap()->ToBoolean(
@@ -393,8 +374,8 @@ RUNTIME_FUNCTION(Runtime_StringGreaterThan) {
 RUNTIME_FUNCTION(Runtime_StringGreaterThanOrEqual) {
   HandleScope handle_scope(isolate);
   DCHECK_EQ(2, args.length());
-  Handle<String> x = args.at<String>(0);
-  Handle<String> y = args.at<String>(1);
+  DirectHandle<String> x = args.at<String>(0);
+  DirectHandle<String> y = args.at<String>(1);
   ComparisonResult result = String::Compare(isolate, x, y);
   DCHECK_NE(result, ComparisonResult::kUndefined);
   return isolate->heap()->ToBoolean(
@@ -402,11 +383,23 @@ RUNTIME_FUNCTION(Runtime_StringGreaterThanOrEqual) {
 }
 
 RUNTIME_FUNCTION(Runtime_StringEqual) {
+  SaveAndClearThreadInWasmFlag non_wasm_scope(isolate);
   HandleScope handle_scope(isolate);
   DCHECK_EQ(2, args.length());
-  Handle<String> x = args.at<String>(0);
-  Handle<String> y = args.at<String>(1);
+  DirectHandle<String> x = args.at<String>(0);
+  DirectHandle<String> y = args.at<String>(1);
   return isolate->heap()->ToBoolean(String::Equals(isolate, x, y));
+}
+
+RUNTIME_FUNCTION(Runtime_StringCompare) {
+  SaveAndClearThreadInWasmFlag non_wasm_scope(isolate);
+  DCHECK_EQ(2, args.length());
+  HandleScope scope(isolate);
+  DirectHandle<String> lhs(Cast<String>(args[0]), isolate);
+  DirectHandle<String> rhs(Cast<String>(args[1]), isolate);
+  ComparisonResult result = String::Compare(isolate, lhs, rhs);
+  DCHECK_NE(result, ComparisonResult::kUndefined);
+  return Smi::FromInt(static_cast<int>(result));
 }
 
 RUNTIME_FUNCTION(Runtime_FlattenString) {
@@ -424,13 +417,13 @@ RUNTIME_FUNCTION(Runtime_StringMaxLength) {
 RUNTIME_FUNCTION(Runtime_StringEscapeQuotes) {
   HandleScope handle_scope(isolate);
   DCHECK_EQ(1, args.length());
-  Handle<String> string = args.at<String>(0);
+  DirectHandle<String> string = args.at<String>(0);
 
   // Equivalent to global replacement `string.replace(/"/g, "&quot")`, but this
   // does not modify any global state (e.g. the regexp match info).
 
   const int string_length = string->length();
-  Handle<String> quotes =
+  DirectHandle<String> quotes =
       isolate->factory()->LookupSingleCharacterStringFromCode('"');
 
   int quote_index = String::IndexOf(isolate, string, quotes, 0);
@@ -447,7 +440,7 @@ RUNTIME_FUNCTION(Runtime_StringEscapeQuotes) {
   }
 
   // Build the replacement string.
-  Handle<String> replacement =
+  DirectHandle<String> replacement =
       isolate->factory()->NewStringFromAsciiChecked("&quot;");
   const int estimated_part_count = static_cast<int>(indices.size()) * 2 + 1;
   ReplacementStringBuilder builder(isolate->heap(), string,
@@ -468,7 +461,36 @@ RUNTIME_FUNCTION(Runtime_StringEscapeQuotes) {
     builder.AddSubjectSlice(prev_index + 1, string_length);
   }
 
-  return *builder.ToString().ToHandleChecked();
+  DirectHandle<String> result;
+  ASSIGN_RETURN_FAILURE_ON_EXCEPTION(isolate, result, builder.ToString());
+  return *result;
+}
+
+RUNTIME_FUNCTION(Runtime_StringIsWellFormed) {
+  HandleScope handle_scope(isolate);
+  DCHECK_EQ(1, args.length());
+  DirectHandle<String> string = args.at<String>(0);
+  return isolate->heap()->ToBoolean(
+      String::IsWellFormedUnicode(isolate, string));
+}
+
+RUNTIME_FUNCTION(Runtime_StringToWellFormed) {
+  HandleScope handle_scope(isolate);
+  DCHECK_EQ(1, args.length());
+  DirectHandle<String> source = args.at<String>(0);
+  if (String::IsWellFormedUnicode(isolate, source)) return *source;
+  // String::IsWellFormedUnicode would have returned true above otherwise.
+  DCHECK(!source->IsOneByteRepresentation());
+  const int length = source->length();
+  DirectHandle<SeqTwoByteString> dest =
+      isolate->factory()->NewRawTwoByteString(length).ToHandleChecked();
+  DisallowGarbageCollection no_gc;
+  String::FlatContent source_contents = source->GetFlatContent(no_gc);
+  DCHECK(source_contents.IsFlat());
+  const uint16_t* source_data = source_contents.ToUC16Vector().begin();
+  uint16_t* dest_data = dest->GetChars(no_gc);
+  unibrow::Utf16::ReplaceUnpairedSurrogates(source_data, dest_data, length);
+  return *dest;
 }
 
 }  // namespace internal

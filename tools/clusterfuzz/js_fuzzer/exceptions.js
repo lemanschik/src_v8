@@ -104,12 +104,19 @@ const DISALLOWED_FLAGS = [
     // Disallowed because they are passed explicitly on the command line.
     '--allow-natives-syntax',
     '--debug-code',
-    '--harmony',
-    '--wasm-staging',
+    '--disable-abortjs',
+    '--enable-slow-asserts',
     '--expose-gc',
     '--expose_gc',
-    '--icu-data-file',
-    '--random-seed',
+    '--fuzzing',
+    '--harmony',
+    '--omit-quit',
+    '--disable-in-process-stack-traces',
+    '--invoke-weak-callbacks',
+    '--verify-heap',
+
+    /^--icu-data-file.*/,
+    /^--random-seed.*/,
 
     // Disallowed due to false positives.
     '--check-handle-count',
@@ -142,6 +149,17 @@ const DISALLOWED_DIFFERENTIAL_FUZZ_FLAGS = [
     '--interpreted-frames-native-stack',
     '--validate-asm',
 ];
+
+// Pairs of flags that shouldn't be used together.
+const CONTRADICTORY_FLAGS = [
+    ['--assert-types', '--stress-concurrent-inlining'],
+    ['--assert-types', '--stress-concurrent-inlining-attach-code'],
+    ['--jitless', '--maglev'],
+    ['--jitless', '--maglev-future'],
+    ['--jitless', '--stress-maglev'],
+    ['--jitless', '--stress-concurrent-inlining'],
+    ['--jitless', '--stress-concurrent-inlining-attach-code'],
+]
 
 const MAX_FILE_SIZE_BYTES = 128 * 1024;  // 128KB
 const MEDIUM_FILE_SIZE_BYTES = 32 * 1024;  // 32KB
@@ -236,6 +254,20 @@ function filterFlags(flags) {
   });
 }
 
+/**
+ * Randomly drops flags to resolve contradicions defined by
+ * `CONTRADICTORY_FLAGS`.
+ */
+function resolveContradictoryFlags(flags) {
+  const flagSet = new Set(flags);
+  for (const [flag1, flag2] of this.CONTRADICTORY_FLAGS) {
+    if (flagSet.has(flag1) && flagSet.has(flag2)) {
+      flagSet.delete(random.single([flag1, flag2]));
+    }
+  }
+  return Array.from(flagSet.values());
+}
+
 function filterDifferentialFuzzFlags(flags) {
   return flags.filter(
       flag => _doesntMatch(DISALLOWED_DIFFERENTIAL_FUZZ_FLAGS, flag));
@@ -243,6 +275,7 @@ function filterDifferentialFuzzFlags(flags) {
 
 
 module.exports = {
+  CONTRADICTORY_FLAGS: CONTRADICTORY_FLAGS,
   filterDifferentialFuzzFlags: filterDifferentialFuzzFlags,
   filterFlags: filterFlags,
   getGeneratedSoftSkipped: getGeneratedSoftSkipped,
@@ -253,4 +286,5 @@ module.exports = {
   isTestSoftSkippedAbs: isTestSoftSkippedAbs,
   isTestSoftSkippedRel: isTestSoftSkippedRel,
   isTestSloppyRel: isTestSloppyRel,
+  resolveContradictoryFlags: resolveContradictoryFlags,
 }

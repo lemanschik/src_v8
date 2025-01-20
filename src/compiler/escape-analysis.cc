@@ -298,10 +298,11 @@ class EscapeAnalysisTracker : public ZoneObject {
 
  private:
   friend class EscapeAnalysisResult;
-  static const size_t kMaxTrackedObjects = 100;
+  static constexpr int kTrackingBudget = 600;
 
   VirtualObject* NewVirtualObject(int size) {
-    if (next_object_id_ >= kMaxTrackedObjects) return nullptr;
+    if (number_of_tracked_bytes_ + size >= kTrackingBudget) return nullptr;
+    number_of_tracked_bytes_ += size;
     return zone_->New<VirtualObject>(&variable_states_, next_object_id_++,
                                      size);
   }
@@ -311,6 +312,7 @@ class EscapeAnalysisTracker : public ZoneObject {
   ZoneUnorderedMap<Node*, bool> framestate_might_lazy_deopt_;
   VariableTracker variable_states_;
   VirtualObject::Id next_object_id_ = 0;
+  int number_of_tracked_bytes_ = 0;
   JSGraph* const jsgraph_;
   Zone* const zone_;
 };
@@ -568,13 +570,17 @@ Maybe<int> OffsetOfElementsAccess(const Operator* op, Node* index_node) {
 }
 
 Node* LowerCompareMapsWithoutLoad(Node* checked_map,
-                                  ZoneHandleSet<Map> const& checked_against,
+                                  ZoneRefSet<Map> const& checked_against,
                                   JSGraph* jsgraph) {
   Node* true_node = jsgraph->TrueConstant();
   Node* false_node = jsgraph->FalseConstant();
   Node* replacement = false_node;
-  for (Handle<Map> map : checked_against) {
-    Node* map_node = jsgraph->HeapConstant(map);
+  for (MapRef map : checked_against) {
+    // We are using HeapConstantMaybeHole here instead of HeapConstantNoHole
+    // as we cannot do the CHECK(object is hole) here as the compile thread is
+    // parked during EscapeAnalysis for performance reasons, see pipeline.cc.
+    // TODO(cffsmith): do manual checking against hole values here.
+    Node* map_node = jsgraph->HeapConstantMaybeHole(map.object());
     // We cannot create a HeapConstant type here as we are off-thread.
     NodeProperties::SetType(map_node, Type::Internal());
     Node* comparison = jsgraph->graph()->NewNode(
@@ -591,6 +597,32 @@ Node* LowerCompareMapsWithoutLoad(Node* checked_map,
   }
   return replacement;
 }
+
+namespace {
+bool CheckMapsHelper(EscapeAnalysisTracker::Scope* current, Node* checked,
+                     ZoneRefSet<Map> target) {
+  const VirtualObject* vobject = current->GetVirtualObject(checked);
+  Variable map_field;
+  Node* map;
+  if (vobject && !vobject->HasEscaped() &&
+      vobject->FieldAt(HeapObject::kMapOffset).To(&map_field) &&
+      current->Get(map_field).To(&map)) {
+    if (map) {
+      Type const map_type = NodeProperties::GetType(map);
+      if (map_type.IsHeapConstant() &&
+          target.contains(map_type.AsHeapConstant()->Ref().AsMap())) {
+        current->MarkForDeletion();
+        return true;
+      }
+    } else {
+      // If the variable has no value, we have not reached the fixed-point
+      // yet.
+      return true;
+    }
+  }
+  return false;
+}
+}  // namespace
 
 void ReduceNode(const Operator* op, EscapeAnalysisTracker::Scope* current,
                 JSGraph* jsgraph) {
@@ -769,25 +801,18 @@ void ReduceNode(const Operator* op, EscapeAnalysisTracker::Scope* current,
     case IrOpcode::kCheckMaps: {
       CheckMapsParameters params = CheckMapsParametersOf(op);
       Node* checked = current->ValueInput(0);
-      const VirtualObject* vobject = current->GetVirtualObject(checked);
-      Variable map_field;
-      Node* map;
-      if (vobject && !vobject->HasEscaped() &&
-          vobject->FieldAt(HeapObject::kMapOffset).To(&map_field) &&
-          current->Get(map_field).To(&map)) {
-        if (map) {
-          Type const map_type = NodeProperties::GetType(map);
-          if (map_type.IsHeapConstant() &&
-              params.maps().contains(
-                  map_type.AsHeapConstant()->Ref().AsMap().object())) {
-            current->MarkForDeletion();
-            break;
-          }
-        } else {
-          // If the variable has no value, we have not reached the fixed-point
-          // yet.
-          break;
-        }
+      if (CheckMapsHelper(current, checked, params.maps())) {
+        break;
+      }
+      current->SetEscaped(checked);
+      break;
+    }
+    case IrOpcode::kTransitionElementsKindOrCheckMap: {
+      ElementsTransitionWithMultipleSources params =
+          ElementsTransitionWithMultipleSourcesOf(op);
+      Node* checked = current->ValueInput(0);
+      if (CheckMapsHelper(current, checked, ZoneRefSet<Map>(params.target()))) {
+        break;
       }
       current->SetEscaped(checked);
       break;
@@ -846,7 +871,7 @@ void ReduceNode(const Operator* op, EscapeAnalysisTracker::Scope* current,
       FrameState frame_state{current->CurrentNode()};
       FrameStateType type = frame_state.frame_state_info().type();
       // This needs to be kept in sync with the frame types supported in
-      // `OptimizedFrame::Summarize`.
+      // `OptimizedJSFrame::Summarize`.
       if (type != FrameStateType::kUnoptimizedFunction &&
           type != FrameStateType::kJavaScriptBuiltinContinuation &&
           type != FrameStateType::kJavaScriptBuiltinContinuationWithCatch) {

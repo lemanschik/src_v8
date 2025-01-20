@@ -119,7 +119,7 @@ class RecursionLevel;
 class ToStringFormatter {
  public:
   ToStringFormatter(Digits X, int radix, bool sign, char* out,
-                    int chars_available, ProcessorImpl* processor)
+                    uint32_t chars_available, ProcessorImpl* processor)
       : digits_(X),
         radix_(radix),
         sign_(sign),
@@ -352,7 +352,7 @@ class RecursionLevel {
   RecursionLevel* next_{nullptr};
   ScratchDigits divisor_;
   std::unique_ptr<Storage> inverse_storage_;
-  Digits inverse_{nullptr, 0};
+  Digits inverse_;
 };
 
 // static
@@ -531,11 +531,11 @@ char* ToStringFormatter::ProcessLevel(RecursionLevel* level, Digits chunk,
 
   // Step 5: Recurse.
   char* end_of_right_part = ProcessLevel(level->next_, right, out, false);
+  if (processor_->should_terminate()) return out;
   // The recursive calls are required and hence designed to write exactly as
   // many characters as their level is responsible for.
   DCHECK(end_of_right_part == out - level->char_count_);
   USE(end_of_right_part);
-  if (processor_->should_terminate()) return out;
   // We intentionally don't use {end_of_right_part} here to be prepared for
   // potential future multi-threaded execution.
   return ProcessLevel(level->next_, left, out - level->char_count_,
@@ -546,17 +546,17 @@ char* ToStringFormatter::ProcessLevel(RecursionLevel* level, Digits chunk,
 
 }  // namespace
 
-void ProcessorImpl::ToString(char* out, int* out_length, Digits X, int radix,
-                             bool sign) {
+void ProcessorImpl::ToString(char* out, uint32_t* out_length, Digits X,
+                             int radix, bool sign) {
   const bool use_fast_algorithm = X.len() >= kToStringFastThreshold;
   ToStringImpl(out, out_length, X, radix, sign, use_fast_algorithm);
 }
 
 // Factored out so that tests can call it.
-void ProcessorImpl::ToStringImpl(char* out, int* out_length, Digits X,
+void ProcessorImpl::ToStringImpl(char* out, uint32_t* out_length, Digits X,
                                  int radix, bool sign, bool fast) {
 #if DEBUG
-  for (int i = 0; i < *out_length; i++) out[i] = kStringZapValue;
+  for (uint32_t i = 0; i < *out_length; i++) out[i] = kStringZapValue;
 #endif
   ToStringFormatter formatter(X, radix, sign, out, *out_length, this);
   if (IsPowerOfTwo(radix)) {
@@ -575,20 +575,21 @@ void ProcessorImpl::ToStringImpl(char* out, int* out_length, Digits X,
   }
   int excess = formatter.Finish();
   *out_length -= excess;
+  memset(out + *out_length, 0, excess);
 }
 
-Status Processor::ToString(char* out, int* out_length, Digits X, int radix,
+Status Processor::ToString(char* out, uint32_t* out_length, Digits X, int radix,
                            bool sign) {
   ProcessorImpl* impl = static_cast<ProcessorImpl*>(this);
   impl->ToString(out, out_length, X, radix, sign);
   return impl->get_and_clear_status();
 }
 
-int ToStringResultLength(Digits X, int radix, bool sign) {
-  const int bit_length = BitLength(X);
-  int result;
+uint32_t ToStringResultLength(Digits X, int radix, bool sign) {
+  const uint32_t bit_length = BitLength(X);
+  uint32_t result;
   if (IsPowerOfTwo(radix)) {
-    const int bits_per_char = CountTrailingZeros(radix);
+    const uint32_t bits_per_char = CountTrailingZeros(radix);
     result = DIV_CEIL(bit_length, bits_per_char) + sign;
   } else {
     // Maximum number of bits we can represent with one character.
@@ -601,8 +602,8 @@ int ToStringResultLength(Digits X, int radix, bool sign) {
     chars_required *= kBitsPerCharTableMultiplier;
     chars_required = DIV_CEIL(chars_required, min_bits_per_char);
     DCHECK(chars_required <
-           static_cast<uint64_t>(std::numeric_limits<int>::max()));
-    result = static_cast<int>(chars_required);
+           static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()));
+    result = static_cast<uint32_t>(chars_required);
   }
   result += sign;
   return result;

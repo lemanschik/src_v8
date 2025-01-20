@@ -4,6 +4,8 @@
 
 #include "src/base/virtual-address-space.h"
 
+#include <optional>
+
 #include "include/v8-platform.h"
 #include "src/base/bits.h"
 #include "src/base/platform/platform.h"
@@ -150,7 +152,7 @@ std::unique_ptr<v8::VirtualAddressSpace> VirtualAddressSpace::AllocateSubspace(
   DCHECK(IsAligned(hint, alignment));
   DCHECK(IsAligned(size, allocation_granularity()));
 
-  base::Optional<AddressSpaceReservation> reservation =
+  std::optional<AddressSpaceReservation> reservation =
       OS::CreateAddressSpaceReservation(
           reinterpret_cast<void*>(hint), size, alignment,
           static_cast<OS::MemoryPermission>(max_page_permissions));
@@ -214,16 +216,20 @@ VirtualAddressSubspace::VirtualAddressSubspace(
 }
 
 VirtualAddressSubspace::~VirtualAddressSubspace() {
+  // TODO(chromium:1218005) here or in the RegionAllocator destructor we should
+  // assert that all allocations have been freed. Otherwise we may end up
+  // leaking memory on Windows because VirtualFree(subspace_base, 0) will then
+  // only free the first allocation in the subspace, not the entire subspace.
   parent_space_->FreeSubspace(this);
 }
 
 void VirtualAddressSubspace::SetRandomSeed(int64_t seed) {
-  MutexGuard guard(&mutex_);
+  SpinningMutexGuard guard(&mutex_);
   rng_.SetSeed(seed);
 }
 
 Address VirtualAddressSubspace::RandomPageAddress() {
-  MutexGuard guard(&mutex_);
+  SpinningMutexGuard guard(&mutex_);
   // Note: the random numbers generated here aren't uniformly distributed if the
   // size isn't a power of two.
   Address addr = base() + (static_cast<uint64_t>(rng_.NextInt64()) % size());
@@ -238,7 +244,7 @@ Address VirtualAddressSubspace::AllocatePages(Address hint, size_t size,
   DCHECK(IsAligned(size, allocation_granularity()));
   DCHECK(IsSubset(permissions, max_page_permissions()));
 
-  MutexGuard guard(&mutex_);
+  SpinningMutexGuard guard(&mutex_);
 
   Address address = region_allocator_.AllocateRegion(hint, size, alignment);
   if (address == RegionAllocator::kAllocationFailure) return kNullAddress;
@@ -257,11 +263,15 @@ void VirtualAddressSubspace::FreePages(Address address, size_t size) {
   DCHECK(IsAligned(address, allocation_granularity()));
   DCHECK(IsAligned(size, allocation_granularity()));
 
-  MutexGuard guard(&mutex_);
+  SpinningMutexGuard guard(&mutex_);
   // The order here is important: on Windows, the allocation first has to be
   // freed to a placeholder before the placeholder can be merged (during the
   // merge_callback) with any surrounding placeholder mappings.
-  CHECK(reservation_.Free(reinterpret_cast<void*>(address), size));
+  if (!reservation_.Free(reinterpret_cast<void*>(address), size)) {
+    // This can happen due to an out-of-memory condition, such as running out
+    // of available VMAs for the process.
+    FatalOOM(OOMType::kProcess, "VirtualAddressSubspace::FreePages");
+  }
   CHECK_EQ(size, region_allocator_.FreeRegion(address));
 }
 
@@ -280,7 +290,7 @@ bool VirtualAddressSubspace::AllocateGuardRegion(Address address, size_t size) {
   DCHECK(IsAligned(address, allocation_granularity()));
   DCHECK(IsAligned(size, allocation_granularity()));
 
-  MutexGuard guard(&mutex_);
+  SpinningMutexGuard guard(&mutex_);
 
   // It is guaranteed that reserved address space is inaccessible, so we just
   // need to mark the region as in-use in the region allocator.
@@ -291,7 +301,7 @@ void VirtualAddressSubspace::FreeGuardRegion(Address address, size_t size) {
   DCHECK(IsAligned(address, allocation_granularity()));
   DCHECK(IsAligned(size, allocation_granularity()));
 
-  MutexGuard guard(&mutex_);
+  SpinningMutexGuard guard(&mutex_);
   CHECK_EQ(size, region_allocator_.FreeRegion(address));
 }
 
@@ -302,7 +312,7 @@ Address VirtualAddressSubspace::AllocateSharedPages(
   DCHECK(IsAligned(size, allocation_granularity()));
   DCHECK(IsAligned(offset, allocation_granularity()));
 
-  MutexGuard guard(&mutex_);
+  SpinningMutexGuard guard(&mutex_);
 
   Address address =
       region_allocator_.AllocateRegion(hint, size, allocation_granularity());
@@ -322,7 +332,7 @@ void VirtualAddressSubspace::FreeSharedPages(Address address, size_t size) {
   DCHECK(IsAligned(address, allocation_granularity()));
   DCHECK(IsAligned(size, allocation_granularity()));
 
-  MutexGuard guard(&mutex_);
+  SpinningMutexGuard guard(&mutex_);
   // The order here is important: on Windows, the allocation first has to be
   // freed to a placeholder before the placeholder can be merged (during the
   // merge_callback) with any surrounding placeholder mappings.
@@ -339,14 +349,14 @@ VirtualAddressSubspace::AllocateSubspace(Address hint, size_t size,
   DCHECK(IsAligned(size, allocation_granularity()));
   DCHECK(IsSubset(max_page_permissions, this->max_page_permissions()));
 
-  MutexGuard guard(&mutex_);
+  SpinningMutexGuard guard(&mutex_);
 
   Address address = region_allocator_.AllocateRegion(hint, size, alignment);
   if (address == RegionAllocator::kAllocationFailure) {
     return std::unique_ptr<v8::VirtualAddressSpace>();
   }
 
-  base::Optional<AddressSpaceReservation> reservation =
+  std::optional<AddressSpaceReservation> reservation =
       reservation_.CreateSubReservation(
           reinterpret_cast<void*>(address), size,
           static_cast<OS::MemoryPermission>(max_page_permissions));
@@ -385,7 +395,7 @@ bool VirtualAddressSubspace::DecommitPages(Address address, size_t size) {
 }
 
 void VirtualAddressSubspace::FreeSubspace(VirtualAddressSubspace* subspace) {
-  MutexGuard guard(&mutex_);
+  SpinningMutexGuard guard(&mutex_);
 
   AddressSpaceReservation reservation = subspace->reservation_;
   Address base = reinterpret_cast<Address>(reservation.base());

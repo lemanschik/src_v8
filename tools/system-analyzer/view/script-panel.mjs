@@ -233,7 +233,8 @@ class ToolTipTableBuilder {
     tr.appendChild(DOM.td(name));
     tr.appendChild(DOM.td(subtypeName));
     tr.appendChild(DOM.td(entries.length));
-    const button = DOM.button('🔎', this._scriptPanel.showToolTipEntriesHandler);
+    const button =
+        DOM.button('🔎', this._scriptPanel.showToolTipEntriesHandler);
     button.title = `Show all ${entries.length} ${name || subtypeName} entries.`
     button.data = entries;
     tr.appendChild(DOM.td(button));

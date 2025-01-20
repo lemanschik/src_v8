@@ -5,6 +5,7 @@
 #include "src/objects/simd.h"
 
 #include "src/base/cpu.h"
+#include "src/codegen/cpu-features.h"
 #include "src/objects/compressed-slots.h"
 #include "src/objects/fixed-array-inl.h"
 #include "src/objects/heap-number-inl.h"
@@ -39,8 +40,12 @@ enum class SimdKinds { kSSE, kNeon, kAVX2, kNone };
 
 inline SimdKinds get_vectorization_kind() {
 #ifdef __SSE3__
-  static base::CPU cpu;
-  if (cpu.has_avx2()) {
+#if defined(V8_TARGET_ARCH_IA32) || defined(V8_TARGET_ARCH_X64)
+  bool has_avx2 = CpuFeatures::IsSupported(AVX2);
+#else
+  bool has_avx2 = false;
+#endif
+  if (has_avx2) {
     return SimdKinds::kAVX2;
   } else {
     // No need for a runtime check since we do not support x86/x64 CPUs without
@@ -150,6 +155,17 @@ inline int32_t reinterpret_vmaxvq_u64(uint64x2_t v) {
     }                                                                         \
   }
 
+#ifdef __SSE3__
+__m128i _mm_cmpeq_epi64_nosse4_2(__m128i a, __m128i b) {
+  __m128i res = _mm_cmpeq_epi32(a, b);
+  // For each 64-bit value swap results of lower 32 bits comparison with
+  // the results of upper 32 bits comparison.
+  __m128i res_swapped = _mm_shuffle_epi32(res, _MM_SHUFFLE(2, 3, 0, 1));
+  // Report match only when both upper and lower parts of 64-bit values match.
+  return _mm_and_si128(res, res_swapped);
+}
+#endif  // __SSE3__
+
 // Uses SIMD to vectorize the search loop. This function should only be called
 // for large-ish arrays. Note that nothing will break if |array_len| is less
 // than vectorization_threshold: things will just be slower than necessary.
@@ -157,11 +173,11 @@ template <typename T>
 inline uintptr_t fast_search_noavx(T* array, uintptr_t array_len,
                                    uintptr_t index, T search_element) {
   static constexpr bool is_uint32 =
-      sizeof(T) == sizeof(uint32_t) && std::is_integral<T>::value;
+      sizeof(T) == sizeof(uint32_t) && std::is_integral_v<T>;
   static constexpr bool is_uint64 =
-      sizeof(T) == sizeof(uint64_t) && std::is_integral<T>::value;
+      sizeof(T) == sizeof(uint64_t) && std::is_integral_v<T>;
   static constexpr bool is_double =
-      sizeof(T) == sizeof(double) && std::is_floating_point<T>::value;
+      sizeof(T) == sizeof(double) && std::is_floating_point_v<T>;
 
   static_assert(is_uint32 || is_uint64 || is_double);
 
@@ -199,12 +215,17 @@ inline uintptr_t fast_search_noavx(T* array, uintptr_t array_len,
 #undef MOVEMASK
 #undef EXTRACT
   } else if constexpr (is_uint64) {
-#define SET1(x) _mm_castsi128_ps(_mm_set1_epi64x(x))
-#define CMP(a, b) _mm_cmpeq_pd(_mm_castps_pd(a), _mm_castps_pd(b))
-#define EXTRACT(x) base::bits::CountTrailingZeros32(x)
-    VECTORIZED_LOOP_x86(__m128, __m128d, SET1, CMP, _mm_movemask_pd, EXTRACT)
-#undef SET1
-#undef CMP
+#define MOVEMASK(x) _mm_movemask_ps(_mm_castsi128_ps(x))
+// _mm_cmpeq_epi64_nosse4_2() might produce only the following non-zero
+// patterns:
+//   0b0011 -> 0 (the first value matches),
+//   0b1100 -> 1 (the second value matches),
+//   0b1111 -> 0 (both first and second value match).
+// Thus it's enough to check only the least significant bit.
+#define EXTRACT(x) (((x) & 1) ? 0 : 1)
+    VECTORIZED_LOOP_x86(__m128i, __m128i, _mm_set1_epi64x,
+                        _mm_cmpeq_epi64_nosse4_2, MOVEMASK, EXTRACT)
+#undef MOVEMASK
 #undef EXTRACT
   } else if constexpr (is_double) {
 #define EXTRACT(x) base::bits::CountTrailingZeros32(x)
@@ -254,11 +275,11 @@ TARGET_AVX2 inline uintptr_t fast_search_avx(T* array, uintptr_t array_len,
                                              uintptr_t index,
                                              T search_element) {
   static constexpr bool is_uint32 =
-      sizeof(T) == sizeof(uint32_t) && std::is_integral<T>::value;
+      sizeof(T) == sizeof(uint32_t) && std::is_integral_v<T>;
   static constexpr bool is_uint64 =
-      sizeof(T) == sizeof(uint64_t) && std::is_integral<T>::value;
+      sizeof(T) == sizeof(uint64_t) && std::is_integral_v<T>;
   static constexpr bool is_double =
-      sizeof(T) == sizeof(double) && std::is_floating_point<T>::value;
+      sizeof(T) == sizeof(double) && std::is_floating_point_v<T>;
 
   static_assert(is_uint32 || is_uint64 || is_double);
 
@@ -354,17 +375,21 @@ Address ArrayIndexOfIncludes(Address array_start, uintptr_t array_len,
   }
 
   if constexpr (kind == ArrayIndexOfIncludesKind::DOUBLE) {
-    FixedDoubleArray fixed_array = FixedDoubleArray::cast(Object(array_start));
-    double* array = static_cast<double*>(
-        fixed_array.RawField(FixedDoubleArray::OffsetOfElementAt(0))
-            .ToVoidPtr());
+    Tagged<FixedDoubleArray> fixed_array =
+        Cast<FixedDoubleArray>(Tagged<Object>(array_start));
+    UnalignedDoubleMember* unaligned_array = fixed_array->begin();
+    // TODO(leszeks): This reinterpret cast is a bit sketchy because the values
+    // are unaligned doubles. Ideally we'd fix the search method to support
+    // UnalignedDoubleMember.
+    static_assert(sizeof(UnalignedDoubleMember) == sizeof(double));
+    double* array = reinterpret_cast<double*>(unaligned_array);
 
     double search_num;
-    if (Object(search_element).IsSmi()) {
-      search_num = Object(search_element).ToSmi().value();
+    if (IsSmi(Tagged<Object>(search_element))) {
+      search_num = Tagged<Object>(search_element).ToSmi().value();
     } else {
-      DCHECK(Object(search_element).IsHeapNumber());
-      search_num = HeapNumber::cast(Object(search_element)).value();
+      DCHECK(IsHeapNumber(Tagged<Object>(search_element)));
+      search_num = Cast<HeapNumber>(Tagged<Object>(search_element))->value();
     }
 
     DCHECK(!std::isnan(search_num));
@@ -372,12 +397,12 @@ Address ArrayIndexOfIncludes(Address array_start, uintptr_t array_len,
     if (reinterpret_cast<uintptr_t>(array) % sizeof(double) != 0) {
       // Slow scalar search for unaligned double array.
       for (; from_index < array_len; from_index++) {
-        if (fixed_array.is_the_hole(static_cast<int>(from_index))) {
+        if (fixed_array->is_the_hole(static_cast<int>(from_index))) {
           // |search_num| cannot be NaN, so there is no need to check against
           // holes.
           continue;
         }
-        if (fixed_array.get_scalar(static_cast<int>(from_index)) ==
+        if (fixed_array->get_scalar(static_cast<int>(from_index)) ==
             search_num) {
           return from_index;
         }
@@ -389,13 +414,14 @@ Address ArrayIndexOfIncludes(Address array_start, uintptr_t array_len,
   }
 
   if constexpr (kind == ArrayIndexOfIncludesKind::OBJECTORSMI) {
-    FixedArray fixed_array = FixedArray::cast(Object(array_start));
-    Tagged_t* array =
-        static_cast<Tagged_t*>(fixed_array.data_start().ToVoidPtr());
+    Tagged<FixedArray> fixed_array =
+        Cast<FixedArray>(Tagged<Object>(array_start));
+    Tagged_t* array = static_cast<Tagged_t*>(
+        fixed_array->RawFieldOfFirstElement().ToVoidPtr());
 
-    DCHECK(!Object(search_element).IsHeapNumber());
-    DCHECK(!Object(search_element).IsBigInt());
-    DCHECK(!Object(search_element).IsString());
+    DCHECK(!IsHeapNumber(Tagged<Object>(search_element)));
+    DCHECK(!IsBigInt(Tagged<Object>(search_element)));
+    DCHECK(!IsString(Tagged<Object>(search_element)));
 
     return search<Tagged_t>(array, array_len, from_index,
                             static_cast<Tagged_t>(search_element));
